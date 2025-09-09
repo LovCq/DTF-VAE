@@ -121,5 +121,4 @@ def standardize_kpi(values, mean=None, std=None, excludes=None):
             val = values
         mean = val.mean()
         std = val.std()
-
     return (values - mean) / std, mean, std

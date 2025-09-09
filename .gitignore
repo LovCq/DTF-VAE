@@ -5,3 +5,7 @@
 /.vscode/
 /git.sh
 /result.txt
+.idea/
+__pycache__/
+*.pyc
+*.log
