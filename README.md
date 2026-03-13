@@ -1,6 +1,8 @@
 # DTF-VAE: A Self-Adaptive Time-Frequency Fusion VAE for Robust Time Series Anomaly Detection
 
+[![Paper](https://img.shields.io/badge/Paper-arxiv.XXXX.XXXXX-red)](https://arxiv.org/abs/xxxx.xxxxx)
 [![GitHub](https://img.shields.io/github/license/LovCq/DTF-VAE)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
 
 Official PyTorch implementation of **DTF-VAE** as described in the paper:  
 *DTF-VAE: A Self-Adaptive Time-Frequency Fusion VAE for Robust Time Series Anomaly Detection*  
@@ -19,9 +21,17 @@ Extensive experiments on four public benchmarks show that DTF-VAE consistently o
 
 ---
 
-##  Key Contributions
+## 🚀 Key Contributions
 
 1. **Dynamic Time-Frequency Fusion** – A cross-modal alignment and adaptive gating mechanism that adjusts modality contributions on a per-window basis, overcoming the limitations of static fusion.
 2. **Composite Objective** – Combines reconstruction, KL regularization, correlation-based dependency preservation, and triplet contrastive learning to enhance latent separability and anomaly sensitivity.
 3. **State-of-the-Art Performance** – Achieves best F1 scores on Yahoo, KPI, WSD, and NAB benchmarks under both point-adjust and delay-tolerant evaluation protocols.
 4. **Robustness** – Extensive ablation and robustness studies demonstrate stable performance under Gaussian noise and random missing data.
+
+
+## 🛠️ Installation
+
+```bash
+git clone https://github.com/LovCq/DTF-VAE.git
+cd DTF-VAE
+pip install -r requirements.txt
