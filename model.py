@@ -81,6 +81,7 @@ class MyVAE(LightningModule):
 
     def forward(self, x, mode, mask):
         if mode in ["train", "valid"]:
+            #print(f"train_x shape: {x.shape}")
             freq_output = self.freq_vae(x, mode, mask)
             time_output = self.time_vae(x, mode, mask)
             freq_mu_x, freq_var_x, freq_rec, freq_mu, freq_var, freq_cond, freq_loss = freq_output
@@ -117,11 +118,90 @@ class MyVAE(LightningModule):
             return [mu_x, var_x, rec_x, (freq_mu, time_mu), (freq_var_clipped, time_var_clipped),
                     (freq_loss, time_loss), freq_loss, time_loss]
         else:
-            freq_mu_x, freq_prob = self.freq_vae(x, "test", mask)
-            time_mu_x, time_prob = self.time_vae(x, "test", mask)
-            mu_x_test = (freq_mu_x + time_mu_x) / 2
-            recon_prob = (freq_prob + time_prob) / 2
-            return [mu_x_test, recon_prob]
+            # Step 1: 子模型 MCMC 修复
+            x_freq_repaired, freq_score = self.freq_vae.MCMC2(x, mask)
+            x_time_repaired, time_score = self.time_vae.MCMC2(x, mask)
+
+            # 调试：打印修复后的数据形状
+            print(f"test_x shape: {x.shape}")
+            print(f"x_freq_repaired shape: {x_freq_repaired.shape}")
+            print(f"x_time_repaired shape: {x_time_repaired.shape}")
+
+            # Step 2: 融合修复后的 x
+            # 确保 x_freq_repaired 和 x_time_repaired 是正确的形状用于 get_conditon
+            freq_cond = self.freq_vae.get_conditon(x_freq_repaired)  # No unsqueeze here
+            time_cond = self.time_vae.get_conditon(
+                x_time_repaired.unsqueeze(1))  # Unsqueeze here for time model if needed
+
+            # 调试：打印条件向量形状
+            print(f"freq_cond shape: {freq_cond.shape}")
+            print(f"time_cond shape: {time_cond.shape}")
+
+            # Step 3: 编码潜在变量
+            freq_z = \
+            self.freq_vae.encode(torch.cat([x_freq_repaired.flatten(1), freq_cond.view(x.size(0), -1)], dim=1))[0]
+            time_z = self.time_vae.encode(x_time_repaired.flatten(1), time_cond.view(x.size(0), -1))[0]
+
+            # 调试：打印潜在变量形状
+            print(f"freq_z shape: {freq_z.shape}")
+            print(f"time_z shape: {time_z.shape}")
+
+            # Step 4: 融合模块
+            gate_weight = self.gate_net(torch.cat([freq_z, time_z], dim=1))
+            fused_z = gate_weight * freq_z + (1 - gate_weight) * time_z
+            fused_z_attn, _ = self.fusion_attention(freq_z.unsqueeze(0), time_z.unsqueeze(0), time_z.unsqueeze(0))
+            fused_z = self.fusion_gate_norm(fused_z + fused_z_attn.squeeze(0))
+
+            # 调试：打印融合后的张量形状
+            print(f"fused_z shape: {fused_z.shape}")
+
+            # Step 5: 条件融合
+            freq_cond_proj = self.freq_cond_proj(freq_cond.view(x.size(0), -1))
+            time_cond_proj = self.time_cond_proj(time_cond.view(x.size(0), -1))
+
+            # 调试：打印投影后的条件向量形状
+            print(f"freq_cond_proj shape: {freq_cond_proj.shape}")
+            print(f"time_cond_proj shape: {time_cond_proj.shape}")
+
+            fused_cond, _ = self.cross_attention(freq_cond_proj.unsqueeze(0), time_cond_proj.unsqueeze(0),
+                                                 time_cond_proj.unsqueeze(0))
+            fused_cond = self.fused_cond_proj(fused_cond.squeeze(0))
+
+            # 调试：打印融合后的条件向量形状
+            print(f"fused_cond shape: {fused_cond.shape}")
+
+            # Step 6: 解码
+            corr_feature = torch.stack(
+                [self.freq_vae.get_global_corr(x_freq_repaired), self.time_vae.get_global_corr(x_time_repaired)], dim=1)
+
+            # 调试：打印全局相关特征形状
+            print(f"corr_feature shape: {corr_feature.shape}")
+
+            decoder_input = torch.cat([fused_z, fused_cond, corr_feature], dim=1)
+            mu_x_flat = self.fusion_decoder(decoder_input)
+            mu_x_fused = mu_x_flat.view(-1, self.hp.num_channels, self.hp.window)
+
+            # 调试：打印解码后的输出形状
+            print(f"mu_x_fused shape: {mu_x_fused.shape}")
+
+            # Step 7: 计算异常分数（通过重构误差和概率计算）
+            var_x_est = torch.ones_like(mu_x_fused) * 1.0  # 简化
+            fused_prob = -0.5 * (torch.log(var_x_est + 1e-8) + (x - mu_x_fused) ** 2 / (var_x_est + 1e-8))
+            fused_score = fused_prob.mean(dim=1)  # 计算异常分数
+
+            # 调试：打印最终的异常分数
+            print(f"fused_score shape: {fused_score.shape}")
+
+            # Step 8: 计算 final_score
+            freq_score = freq_score.squeeze(1)  # 确保 freq_score 维度为 [batch_size, window]
+            #time_score = time_score.squeeze(1)  # 确保 time_score 维度为 [batch_size, window]
+            print(
+                f"freq_score shape: {freq_score.shape}, time_score shape: {time_score.shape}, fused_score shape: {fused_score.shape}")
+            final_score = freq_score
+            #final_score = 0.75 * freq_score + 0.3 * time_score + 0.7 * fused_score  # 最终异常分数
+
+            return mu_x_fused, final_score
+
 
     def loss(self, x, y_all, z_all, mode="train"):
         mask = torch.logical_not(torch.logical_or(y_all, z_all))
@@ -233,26 +313,79 @@ class MyVAE(LightningModule):
         y = y_all[:, -1].unsqueeze(1)  # Last timestep label
         mask = torch.logical_not(torch.logical_or(y_all, z_all))
         with torch.no_grad():
-            freq_mu_x, freq_prob = self.freq_vae(x, "test", mask)  # [batch_size, num_channels, window]
-            time_mu_x, time_prob = self.time_vae(x, "test", mask)  # [batch_size, window]
-            freq_var = self.freq_vae.fc_var_x(freq_mu_x).mean(dim=1)  # [batch_size, window]
-            time_var = self.time_vae.fc_var_x(time_mu_x.unsqueeze(1)).mean(dim=1)  # [batch_size, window]
-            weight_freq = 1.0 / (freq_var + 1e-8)  # [batch_size, window]
-            weight_time = 1.0 / (time_var + 1e-8)  # [batch_size, window]
+            freq_mu_x, freq_prob = self.freq_vae(x, "test", mask)  # [B, C, W]
+            time_mu_x, time_prob = self.time_vae(x, "test", mask)  # [B, W]
+            freq_var = self.freq_vae.fc_var_x(freq_mu_x).mean(dim=1)  # [B, W]
+            time_var = self.time_vae.fc_var_x(time_mu_x.unsqueeze(1)).mean(dim=1)  # [B, W]
+            weight_freq = 1.0 / (freq_var + 1e-8)  # [B, W]
+            weight_time = 1.0 / (time_var + 1e-8)  # [B, W]
             weight_sum = weight_freq + weight_time
-            weight_freq = torch.clamp(weight_freq / weight_sum, min=0.3, max=0.7)  # [batch_size, window]
-            weight_time = torch.clamp(weight_time / weight_sum, min=0.3, max=0.7)  # [batch_size, window]
-            # Expand time_mu_x and time_prob to match freq_mu_x's shape
-            time_mu_x_expanded = time_mu_x.unsqueeze(1).expand(-1, self.hp.num_channels, -1)  # [batch_size, num_channels, window]
-            time_prob_expanded = time_prob.unsqueeze(1).expand(-1, self.hp.num_channels, -1)  # [batch_size, num_channels, window]
-            # Compute per-timestep reconstruction and probability
-            mu_x_test = weight_freq.unsqueeze(1) * freq_mu_x + weight_time.unsqueeze(1) * time_mu_x_expanded  # [batch_size, num_channels, window]
-            recon_prob = weight_freq.unsqueeze(1) * freq_prob + weight_time.unsqueeze(1) * time_prob_expanded  # [batch_size, num_channels, window]
-            # Compute per-timestep anomaly score
-            recon_error = torch.abs(x - mu_x_test)  # [batch_size, num_channels, window]
-            anomaly_score = recon_error * (1 - recon_prob)  # Higher error and lower prob -> higher anomaly score
-            anomaly_score = anomaly_score.mean(dim=1)  # [batch_size, window]
-            x_last = x[:, 0, -1]  # Last timestep of first channel
+            weight_freq = torch.clamp(weight_freq / weight_sum, min=0.3, max=0.7)
+            weight_time = torch.clamp(weight_time / weight_sum, min=0.3, max=0.7)
+
+            time_mu_x_expanded = time_mu_x.unsqueeze(1).expand(-1, self.hp.num_channels, -1)  # [B, C, W]
+            time_prob_expanded = time_prob.unsqueeze(1).expand(-1, self.hp.num_channels, -1)  # [B, C, W]
+
+            # =========================
+            # 新增：动态融合模块推理（最小改动版本）
+            # =========================
+            # 注意：这里 freq_mu_x / time_mu_x 是 mode="test" 返回的 repaired x
+            x_freq_repaired = freq_mu_x  # [B, C, W]
+            x_time_repaired = time_mu_x  # [B, W]
+
+            # 1) 用 repaired x 走 valid 路径拿 latent/cond（动态融合的输入对齐 MCMC）
+            freq_out = self.freq_vae(x_freq_repaired, "valid", mask)
+            # time 模型如果 valid 输入需要 [B,1,W]，就 unsqueeze(1)
+            time_in = x_time_repaired.unsqueeze(1)  # [B,1,W]
+            time_out = self.time_vae(time_in, "valid", mask)
+
+            freq_mu = freq_out[3]
+            freq_cond = freq_out[5]
+            time_mu = time_out[3]
+            time_cond = time_out[5]
+
+            # 2) condition 动态融合（与训练一致）
+            freq_cond_proj = self.freq_cond_proj(freq_cond)
+            time_cond_proj = self.time_cond_proj(time_cond)
+            fused_cond, _ = self.cross_attention(
+                freq_cond_proj.unsqueeze(0),
+                time_cond_proj.unsqueeze(0),
+                time_cond_proj.unsqueeze(0),
+            )
+            fused_cond_proj = self.fused_cond_proj(fused_cond.squeeze(0))
+
+            # 3) latent 动态融合（与训练一致）
+            gate_weight = self.gate_net(torch.cat([freq_mu, time_mu], dim=1))
+            fused_z_gate = gate_weight * freq_mu + (1.0 - gate_weight) * time_mu
+
+            fused_z_attn, _ = self.fusion_attention(
+                freq_mu.unsqueeze(0),
+                time_mu.unsqueeze(0),
+                time_mu.unsqueeze(0),
+            )
+            fused_z = self.fusion_gate_norm(fused_z_gate + fused_z_attn.squeeze(0))
+
+            # 4) corr_feature：建议仍用原始 x（与训练一致），或用 repaired x（二选一）
+            freq_corr = self.freq_vae.get_global_corr(x)  # 或 x_freq_repaired
+            time_corr = self.time_vae.get_global_corr(x)  # 或 x_time_repaired.unsqueeze(1)
+            corr_feature = torch.stack([freq_corr, time_corr], dim=1)
+
+            # 5) fusion_decoder 输出 mu_x_test
+            decoder_input = torch.cat([fused_z, fused_cond_proj, corr_feature], dim=1)
+            mu_x_flat = self.fusion_decoder(decoder_input)
+            mu_x_test = mu_x_flat.view(-1, self.hp.num_channels, self.hp.window)
+
+            # 6) recon_prob：先保留基线的 MCMC 概率加权（不要换 fusion var 版本）
+            # recon_prob 本来就是你前面算出来的静态融合概率项：
+            recon_prob = weight_freq.unsqueeze(1) * freq_prob + weight_time.unsqueeze(1) * time_prob_expanded
+
+            # 7) anomaly_score：仍沿用你原来的公式（最小改动）
+            recon_error = torch.abs(x - mu_x_test)
+            anomaly_score = recon_error * (1 - recon_prob)
+            anomaly_score = anomaly_score.mean(dim=1)  # [B, W]
+
+            x_last = x[:, 0, -1]
+
         outputs = OrderedDict({
             "y": y.cpu().flatten(),
             "anomaly_score": anomaly_score.cpu(),  # [batch_size, window]
@@ -260,21 +393,40 @@ class MyVAE(LightningModule):
             "x": x_last.cpu().flatten(),
             "x_full": x.cpu(),
             "y_full": y_all.cpu(),
-            "freq_mu_x": freq_mu_x.cpu(),
-            "time_mu_x": time_mu_x.cpu(),
         })
         self.test_outputs.append(outputs)
         return outputs
+
+    # def test_step(self, data_batch, batch_idx):
+    #     x, y_all, z_all = data_batch['x'], data_batch['y'], data_batch['z']
+    #     y = y_all[:, -1].unsqueeze(1)  # Last timestep label
+    #     mask = torch.logical_not(torch.logical_or(y_all, z_all))
+    #
+    #     with torch.no_grad():
+    #         # Use forward's test mode
+    #         mu_x_fused, final_score = self.forward(x, mode="test", mask=mask)
+    #
+    #         # Return outputs with updated keys
+    #         outputs = OrderedDict({
+    #             "y": y.cpu().flatten(),
+    #             "anomaly_score": final_score.cpu(),  # Using final_score from forward
+    #             "mu_x_test": mu_x_fused.cpu(),  # [batch_size, num_channels, window]
+    #             "x": x[:, 0, -1].cpu().flatten(),  # Last timestep of first channel
+    #             "x_full": x.cpu(),
+    #             "y_full": y_all.cpu(),
+    #         })
+    #         self.test_outputs.append(outputs)
+    #         return outputs
 
     def on_test_epoch_end(self):
         all_y = torch.cat([output['y'] for output in self.test_outputs], dim=0).numpy()
         all_anomaly_score = torch.cat([output['anomaly_score'] for output in self.test_outputs], dim=0).numpy()  # [n_samples, window]
         all_mu_x_test = torch.cat([output['mu_x_test'] for output in self.test_outputs], dim=0).numpy()
         all_x = torch.cat([output['x'] for output in self.test_outputs], dim=0).numpy()
-        all_x_full = torch.cat([output['x_full'] for output in self.test_outputs], dim=0).numpy()
-        all_y_full = torch.cat([output['y_full'] for output in self.test_outputs], dim=0).numpy()
-        all_freq_mu_x = torch.cat([output['freq_mu_x'] for output in self.test_outputs], dim=0).numpy()
-        all_time_mu_x = torch.cat([output['time_mu_x'] for output in self.test_outputs], dim=0).numpy()
+        # all_x_full = torch.cat([output['x_full'] for output in self.test_outputs], dim=0).numpy()
+        # all_y_full = torch.cat([output['y_full'] for output in self.test_outputs], dim=0).numpy()
+        # all_freq_mu_x = torch.cat([output['freq_mu_x'] for output in self.test_outputs], dim=0).numpy()
+        # all_time_mu_x = torch.cat([output['time_mu_x'] for output in self.test_outputs], dim=0).numpy()
 
         df = pd.DataFrame({
             'y': all_y,
@@ -291,7 +443,7 @@ class MyVAE(LightningModule):
         elif self.hp.data_dir == "./data/NAB" or self.hp.data_dir == "./data/new_NAB":
             k = 150
         else:
-            k = 7
+            k = 50
         try:
             auc = roc_auc_score(y_true=label, y_score=score)
         except ValueError:
@@ -367,6 +519,34 @@ class MyVAE(LightningModule):
             self.hp.sliding_window_size,
             data_pre_mode=self.hp.data_pre_mode,
         )
+        # ===== model.py / MyVAE.mydataloader 里：dataset 创建后加入 =====
+        if not hasattr(self, "_printed_dataset_stats"):
+            self._printed_dataset_stats = set()
+
+        if mode not in self._printed_dataset_stats:
+            self._printed_dataset_stats.add(mode)
+
+            print("\n" + "=" * 80)
+            print(f"[Dataset Stats] mode={mode}")
+            print(f"  data_dir: {self.hp.data_dir}")
+            print(f"  window(W): {self.hp.window}, sliding_window_size: {self.hp.sliding_window_size}")
+            print(f"  #files: {getattr(dataset, 'n_files', 'NA')}")
+            print(f"  raw_rows_after_split (sum over files): {getattr(dataset, 'total_raw_rows', 'NA')}")
+            print(f"  completed_len (sum): {getattr(dataset, 'total_completed_len', 'NA')}")
+            print(f"  smoothed_len (sum): {getattr(dataset, 'total_smoothed_len', 'NA')}")
+            print(f"  window_samples (=len(dataset)): {len(dataset)}")
+            # 可选：也打印 total_windows 对照
+            if hasattr(dataset, "total_windows"):
+                print(f"  total_windows (check): {dataset.total_windows}")
+
+            # 可选：打印前几个文件明细
+            if hasattr(dataset, "file_stats") and len(dataset.file_stats) > 0:
+                print("  per-file (first 3):")
+                for d in dataset.file_stats[:3]:
+                    print(f"    {d['file']}: raw={d['raw_rows_after_split']}, "
+                          f"completed={d['completed_len']}, smoothed={d['smoothed_len']}, windows={d['window_samples']}")
+            print("=" * 80 + "\n")
+
         num_channels = dataset.samples.shape[1]
         self.hp.num_channels = num_channels
         train_sampler = None
@@ -413,8 +593,8 @@ class MyVAE(LightningModule):
     @staticmethod
     def add_model_specific_args():
         parser = argparse.ArgumentParser()
-        parser.add_argument("--data_name", default="0efb375b-b902-3661-ab23-9a0bb799f4e3.csv", type=str)
-        parser.add_argument("--ckpt_path", default="./ckpt/0efb375b-b902-3661-ab23-9a0bb799f4e3.csv-v171.ckpt", type=str)
+        parser.add_argument("--data_name", default=None, type=str)
+        parser.add_argument("--ckpt_path", default=None, type=str)
         parser.add_argument("--data_dir", default="./data/WSD/", type=str)
         parser.add_argument("--window", default=128, type=int)
         parser.add_argument("--latent_dim", default=8, type=int)
@@ -426,7 +606,7 @@ class MyVAE(LightningModule):
         parser.add_argument("--sliding_window_size", default=1, type=int)
         parser.add_argument("--save_file", default="./result/Score.txt", type=str)
         parser.add_argument("--data_pre_mode", default=0, type=int)
-        parser.add_argument("--missing_data_rate", default=0.005, type=float)
+        parser.add_argument("--missing_data_rate", default=0.01, type=float)
         parser.add_argument("--point_ano_rate", default=0.02, type=float)
         parser.add_argument("--seg_ano_rate", default=0.05, type=float)
         parser.add_argument("--eval_all", default=0, type=int)

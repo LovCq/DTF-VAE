@@ -1,3 +1,4 @@
+# train.py
 from ast import arg
 import os
 import logging
@@ -16,10 +17,11 @@ np.random.seed(SEED)
 
 logger = TensorBoardLogger(name="logs", save_dir="./")
 
+
 def main(hparams):
-    print("loading model...")
+    print("Loading model...")
     model = MyVAE(hparams)
-    print("model built")
+    print("Model built")
     early_stop = EarlyStopping(
         monitor="val_loss_valid_epoch", patience=5, verbose=True, mode="min"
     )
@@ -36,23 +38,21 @@ def main(hparams):
         accelerator="gpu",
         devices=[hparams.gpu],
         check_val_every_n_epoch=1,
-        gradient_clip_algorithm="value",  # Still specify algorithm if needed elsewhere, but no clipping value
-        # Removed: gradient_clip_val=2
+        gradient_clip_algorithm="value",
     )
 
-    print("fit start")
+    print("Fit start")
     trainer.fit(model)
+    print("Testing start")
     trainer.test(model)
+
+    # Print TensorBoard log instructions
     print("View tensorboard logs by running\ntensorboard --logdir %s" % os.getcwd())
     print("and going to http://localhost:6006 on your browser")
+
 
 if __name__ == "__main__":
     parser = MyVAE.add_model_specific_args()
     hyperparams = parser.parse_args()
-    print(f"RUNNING")
-    if hyperparams.only_test == 1:
-        model = MyVAE.load_from_checkpoint(checkpoint_path=hyperparams.ckpt_path)
-        trainer = Trainer(accelerator="gpu", devices=1)
-        trainer.test(model)
-    else:
-        main(hyperparams)
+    print(f"RUNNING with hyperparameters: {hyperparams}")
+    main(hyperparams)
